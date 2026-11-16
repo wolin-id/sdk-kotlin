@@ -2,7 +2,7 @@
 
 # Wolin Kotlin SDK (`id.wolin:sdk-kotlin`)
 
-**Official Zero-Dependency Kotlin, Android & JVM SDK for Wolin Sovereign Solid Pods**
+**Official Zero-Dependency Kotlin, Android & JVM SDK for Wolin (月印千江) Sovereign Solid Pods**
 
 [![CI](https://github.com/wolin-id/sdk-kotlin/actions/workflows/ci.yml/badge.svg)](https://github.com/wolin-id/sdk-kotlin/actions/workflows/ci.yml)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.1%2B-7F52FF.svg)](https://kotlinlang.org)
@@ -19,10 +19,21 @@ Built purely on the **Kotlin standard library**, `java.net.http.HttpClient`, and
 
 ## Features
 
-- **RFC 9449 DPoP (`ES256`) Proof-of-Possession**: Ephemeral or persistent NIST `P-256` (`secp256r1`) keypair signing using `SHA256withECDSA` with strict ASN.1 DER-to-IEEE-P1363 (64-byte `R || S`) conversion, `ath` access-token hash binding, and automatic `DPoP-Nonce` challenge retry.
+- **RFC 9449 DPoP (`ES256`) Proof-of-Possession**: Ephemeral or persistent NIST `P-256` (`secp256r1`) keypair signing using `SHA256withECDSA` with strict ASN.1 DER-to-IEEE-P1363 (64-byte `R || S`) conversion, `ath` access-token hash binding, and automatic per-origin `DPoP-Nonce` challenge retry.
 - **RFC 7638 JWK Thumbprints (`jkt`)**: Canonical SHA-256 EC public JWK thumbprint calculation matching Solid-OIDC `cnf.jkt` token bindings.
 - **WebID Profile & `pim:storage` Discovery**: Pure-stdlib W3C Turtle / N-Triples parser extracting `pim:storage`, `solid:oidcIssuer`, `ldp:inbox`, and `rdf:type` triples with RFC 8288 `Link: <http://www.w3.org/ns/pim/space#Storage>; rel="type"` container fallback.
 - **Solid LDP CRUD + Optimistic Concurrency**: `HEAD`, `GET`, `PUT`, and `DELETE` operations with `ETag`, `If-Match`, and `If-None-Match` (`createIfAbsent` / `getIfModified`) guards.
+- **Safe Signed-Asset Offload Redirects (`302 Found`)**: Uses `HttpClient.Redirect.NEVER` and follows short-lived HMAC-signed Edge/R2/CDN redirects on `GET` / `HEAD` **without** leaking `Authorization` or `DPoP` headers across origins.
+- **`pod_id` Handle Validation**: Built-in `WolinClient.isValidPodId()` and `WolinClient.validatePodId()` (`3..32` chars, lowercase `[a-z0-9-]`, starts/ends with `[a-z0-9]`, no `--`, reserved-handle blocklist).
+
+---
+
+## Official Production Endpoints
+
+| Service | Endpoint | Constant |
+| :--- | :--- | :--- |
+| Solid-OIDC Provider & Passport | `https://auth.wolin.id` | `WolinClient.DEFAULT_AUTH_URL` |
+| Sovereign Solid Pod Engine | `https://pod.wolin.id` | `WolinClient.DEFAULT_POD_URL` |
 
 ---
 
@@ -45,6 +56,9 @@ import id.wolin.sdk.DPoPSigner
 import id.wolin.sdk.WolinClient
 
 fun main() {
+    // Validate Pod handle format (3..32 chars, lowercase [a-z0-9-], no '--')
+    check(WolinClient.isValidPodId("alice"))
+
     // 1. Generate (or load) the P-256 DPoP keypair bound to your Solid-OIDC access token
     val signer = DPoPSigner.generate()
     println("Client JWK Thumbprint (cnf.jkt): ${signer.jwkThumbprint}")
@@ -54,8 +68,10 @@ fun main() {
         dpopSigner = signer,
     )
 
-    // 2. Dereference WebID Profile & discover Sovereign Pod pim:storage root
+    // 2. Dereference WebID Profile & verify Solid-OIDC issuer (https://auth.wolin.id)
     val webId = "https://alice.wolin.id/profile/card#me"
+    val profile = client.fetchWebIdProfile(webId)
+    check(profile.verifyOidcIssuer(WolinClient.DEFAULT_AUTH_URL))
     val storageRoot = client.discoverStorage(webId)
 
     // 3. Create an RDF resource with If-None-Match: *
@@ -84,13 +100,29 @@ fun main() {
 }
 ```
 
+## `pod_id` Format Rules
+
+Wolin Pod handles (`{pod_id}.wolin.id` and `https://pod.wolin.id/pods/{pod_id}/`) enforce strict DNS-label & anti-spoofing rules:
+
+- Length: `3..32` characters
+- Characters: lowercase ASCII `[a-z0-9-]`, starting and ending with `[a-z0-9]`
+- No consecutive hyphens (`--`)
+- Reserved system/infrastructure handles (e.g., `auth`, `pod`, `pods`, `api`, `admin`, `wolin`, `www`) are rejected
+
+```kotlin
+check(WolinClient.isValidPodId("alice-01"))
+check(!WolinClient.isValidPodId("ab"))          // < 3 chars
+check(!WolinClient.isValidPodId("alice--dev"))  // consecutive '--'
+check(!WolinClient.isValidPodId("auth"))        // reserved handle
+```
+
 ---
 
 ## Package Layout
 
 | Source File | Responsibility |
 | :--- | :--- |
-| `id.wolin.sdk.WolinClient` | Solid-OIDC + DPoP HTTP client, `DPoP-Nonce` retry, WebID discovery, and LDP `HEAD`/`GET`/`PUT`/`DELETE` |
+| `id.wolin.sdk.WolinClient` | Solid-OIDC + DPoP HTTP client, `DPoP-Nonce` retry, safe `302` asset redirects, `pod_id` validation, and LDP `HEAD`/`GET`/`PUT`/`DELETE` |
 | `id.wolin.sdk.DPoPSigner` | NIST P-256 `SHA256withECDSA` signer, ASN.1 DER ↔ IEEE P1363 converter, RFC 9449 proofs, RFC 7638 `jkt` |
 | `id.wolin.sdk.WebIdParser` | Pure-stdlib W3C Turtle & N-Triples lexer/parser for Solid WebID profiles and `pim:storage` discovery |
 | `id.wolin.sdk.PodResource` | Immutable LDP resource representation, RFC 8288 `Link` parser, and typed `WolinHttpException` errors |
