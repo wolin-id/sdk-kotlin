@@ -303,6 +303,85 @@ class WolinClientTest {
         assertEquals("$baseUrl/bob/", storage)
     }
 
+    @Test
+    fun `validatePodId enforces 3 to 32 lowercase characters, no double hyphens, and reserved blocklist`() {
+        assertEquals("https://auth.wolin.id", WolinClient.DEFAULT_AUTH_URL)
+        assertEquals("https://pod.wolin.id", WolinClient.DEFAULT_POD_URL)
+
+        for (valid in listOf("bob", "alice", "alice-01", "a".repeat(32), "team-alpha-2026")) {
+            assertTrue(WolinClient.isValidPodId(valid), valid)
+            assertEquals(valid, WolinClient.validatePodId(valid))
+        }
+
+        for (invalid in listOf(
+            "", "a", "ab", "a".repeat(33), "Alice", "-alice", "alice-",
+            "alice--dev", "xn--p1ai", "alice_01", "alice.dev",
+            "auth", "pod", "pods", "api", "admin", "wolin", "www",
+        )) {
+            assertFalse(WolinClient.isValidPodId(invalid), invalid)
+            assertThrows<WolinException> { WolinClient.validatePodId(invalid) }
+        }
+    }
+
+    @Test
+    fun `WolinClient follows 302 signed asset redirect without leaking Authorization or DPoP headers`() {
+        val offloadedBytes = "wolin-signed-r2-binary-asset-payload".toByteArray(StandardCharsets.UTF_8)
+        var cdnSawAuthHeader = false
+        var cdnSawDpopHeader = false
+
+        val cdnServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        cdnServer.executor = Executors.newCachedThreadPool()
+        val cdnBaseUrl = "http://127.0.0.1:${cdnServer.address.port}"
+        cdnServer.createContext("/assets/alice/media/clip.bin") { ex ->
+            cdnSawAuthHeader = ex.requestHeaders.containsKey("Authorization")
+            cdnSawDpopHeader = ex.requestHeaders.containsKey("DPoP")
+            if (cdnSawAuthHeader || cdnSawDpopHeader) {
+                sendPlain(ex, 400, "Leaked Authorization or DPoP header to external asset CDN")
+                return@createContext
+            }
+            if (ex.requestURI.query != "exp=1763500060&sig=ok") {
+                sendPlain(ex, 403, "Invalid signed query")
+                return@createContext
+            }
+            ex.responseHeaders.set("Content-Type", "application/octet-stream")
+            ex.sendResponseHeaders(200, offloadedBytes.size.toLong())
+            ex.responseBody.use { it.write(offloadedBytes) }
+        }
+        cdnServer.start()
+
+        try {
+            server.createContext("/alice/pod/media/clip.bin") { ex ->
+                if (!verifyDpopAuth(ex, "GET", "$baseUrl/alice/pod/media/clip.bin")) {
+                    return@createContext
+                }
+                ex.responseHeaders.set("Location", "$cdnBaseUrl/assets/alice/media/clip.bin?exp=1763500060&sig=ok")
+                ex.responseHeaders.set("ETag", computeEtag(offloadedBytes))
+                ex.responseHeaders.add(
+                    "Link",
+                    "<${PodResource.LDP_NON_RDF_SOURCE}>; rel=\"type\", <$baseUrl/alice/pod/media/clip.bin.acl>; rel=\"acl\"",
+                )
+                ex.responseHeaders.set("Cache-Control", "private, no-store")
+                ex.sendResponseHeaders(302, -1)
+                ex.close()
+            }
+
+            val signer = DPoPSigner.generate()
+            expectedJkt = signer.jwkThumbprint
+            val client = WolinClient(accessToken = expectedToken, dpopSigner = signer)
+
+            val asset = client.get("$baseUrl/alice/pod/media/clip.bin")
+            assertEquals(200, asset.statusCode)
+            assertArrayEquals(offloadedBytes, asset.body)
+            assertEquals(computeEtag(offloadedBytes), asset.etag)
+            assertTrue(asset.linkTypes.contains(PodResource.LDP_NON_RDF_SOURCE))
+            assertEquals("$baseUrl/alice/pod/media/clip.bin.acl", asset.aclUrl)
+            assertFalse(cdnSawAuthHeader)
+            assertFalse(cdnSawDpopHeader)
+        } finally {
+            cdnServer.stop(0)
+        }
+    }
+
     // --- Embedded Solid-OIDC + DPoP + LDP Verification Server ---
 
     private fun handleExchange(exchange: HttpExchange) {

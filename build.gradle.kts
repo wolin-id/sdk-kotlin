@@ -52,7 +52,7 @@ publishing {
             pom {
                 name.set("Wolin Kotlin SDK")
                 description.set(
-                    "Official zero-dependency Kotlin/Android/JVM SDK for Wolin Sovereign Solid Pods (Solid-OIDC, RFC 9449 DPoP ES256, WebID, LDP CRUD)"
+                    "Official zero-dependency Kotlin/Android/JVM SDK for Wolin (月印千江) Sovereign Solid Pods (Solid-OIDC, RFC 9449 DPoP ES256, WebID, LDP CRUD)"
                 )
                 url.set("https://wolin.id")
                 licenses {

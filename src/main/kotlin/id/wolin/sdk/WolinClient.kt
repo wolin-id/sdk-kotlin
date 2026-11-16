@@ -7,15 +7,16 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
 import java.time.Duration
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Official Wolin Sovereign Solid Pod Client for Kotlin, Android, and JVM.
+ * Official Wolin (月印千江) Sovereign Solid Pod Client for Kotlin, Android, and JVM.
  *
  * Implements:
  * - **Solid-OIDC + RFC 9449 DPoP (`ES256`)** proof-of-possession request signing & `DPoP-Nonce` challenge retry
  * - **WebID Profile dereferencing** & **`pim:storage` root discovery** (Turtle triples + RFC 8288 `Link` fallback)
  * - **W3C Solid LDP CRUD (`HEAD` / `GET` / `PUT` / `DELETE`)** with **`ETag` / `If-Match` / `If-None-Match`** optimistic concurrency
+ * - **Safe Signed-Asset Offload (`302 Found`)** redirect handling without leaking `Authorization` or `DPoP` headers to external CDN/R2 URLs
  */
 class WolinClient @JvmOverloads constructor(
     val accessToken: String? = null,
@@ -24,7 +25,7 @@ class WolinClient @JvmOverloads constructor(
     private val requestTimeout: Duration = DEFAULT_REQUEST_TIMEOUT,
     private val userAgent: String = DEFAULT_USER_AGENT,
 ) {
-    private val cachedDpopNonce = AtomicReference<String?>(null)
+    private val dpopNonces = ConcurrentHashMap<String, String>()
 
     init {
         if (accessToken != null && accessToken.isBlank()) {
@@ -113,16 +114,15 @@ class WolinClient @JvmOverloads constructor(
      * Executes an HTTP `HEAD` request against a Solid LDP resource to inspect `ETag` and `Link` metadata.
      */
     fun head(url: String): PodResource =
-        sendLdpRequest(
+        sendSafeReadLdpRequest(
             method = "HEAD",
             url = url,
             headers = mapOf("Accept" to DEFAULT_ACCEPT),
-            body = null,
-            expectedStatuses = SUCCESS_STATUSES,
         )
 
     /**
      * Fetches a Solid LDP resource via `GET`, returning its payload, `Content-Type`, and `ETag`.
+     * Safely follows `302 Found` signed asset offload redirects without leaking `Authorization` or `DPoP` headers.
      *
      * @param ifMatch Optional `If-Match` precondition (raises [WolinHttpException] with status 412 on mismatch).
      */
@@ -136,12 +136,10 @@ class WolinClient @JvmOverloads constructor(
         if (!ifMatch.isNullOrBlank()) {
             headers["If-Match"] = ifMatch
         }
-        return sendLdpRequest(
+        return sendSafeReadLdpRequest(
             method = "GET",
             url = url,
             headers = headers,
-            body = null,
-            expectedStatuses = SUCCESS_STATUSES,
         )
     }
 
@@ -157,18 +155,18 @@ class WolinClient @JvmOverloads constructor(
         accept: String = DEFAULT_ACCEPT,
     ): PodResource? {
         require(etag.isNotBlank()) { "etag for getIfModified must not be blank" }
-        val response = sendRawWithAuthRetry(
+        val initialUri = HeaderUtils.validateHttpUri(url)
+        val (response, fallbackHeaders) = sendSafeReadRaw(
             method = "GET",
-            uri = HeaderUtils.validateHttpUri(url),
+            initialUri = initialUri,
             headers = mapOf(
                 "Accept" to accept,
                 "If-None-Match" to etag,
             ),
-            body = null,
         )
-        return when (val status = response.statusCode()) {
+        return when (response.statusCode()) {
             304 -> null
-            in 200..299 -> toPodResource(url, response)
+            in 200..299 -> toPodResource(url, response, fallbackHeaders)
             else -> throw toHttpException(url, response)
         }
     }
@@ -280,6 +278,64 @@ class WolinClient @JvmOverloads constructor(
         )
     }
 
+    private fun sendSafeReadLdpRequest(
+        method: String,
+        url: String,
+        headers: Map<String, String>,
+    ): PodResource {
+        val initialUri = HeaderUtils.validateHttpUri(url)
+        val (response, fallbackHeaders) = sendSafeReadRaw(method, initialUri, headers)
+        if (response.statusCode() !in SUCCESS_STATUSES) {
+            throw toHttpException(url, response)
+        }
+        return toPodResource(url, response, fallbackHeaders)
+    }
+
+    private fun sendSafeReadRaw(
+        method: String,
+        initialUri: URI,
+        headers: Map<String, String>,
+    ): Pair<HttpResponse<ByteArray>, Map<String, List<String>>?> {
+        var response = sendRawWithAuthRetry(
+            method = method,
+            uri = initialUri,
+            headers = headers,
+            body = null,
+            includeAuth = true,
+        )
+        if (response.statusCode() !in REDIRECT_STATUSES) {
+            return response to null
+        }
+
+        val podRedirectHeaders = response.headers().map()
+        val initialOrigin = originKey(initialUri)
+        var currentUri = initialUri
+
+        repeat(MAX_SAFE_REDIRECTS) {
+            val location = HeaderUtils.firstHeader(response.headers().map(), "location")
+                ?: return response to podRedirectHeaders
+            val nextUri = resolveRedirectUri(currentUri, location)
+            val sameOrigin = originKey(nextUri) == initialOrigin
+
+            val redirectHeaders = linkedMapOf<String, String>()
+            headers["Accept"]?.let { redirectHeaders["Accept"] = it }
+
+            response = sendRawWithAuthRetry(
+                method = method,
+                uri = nextUri,
+                headers = redirectHeaders,
+                body = null,
+                includeAuth = sameOrigin,
+            )
+            currentUri = nextUri
+            if (response.statusCode() !in REDIRECT_STATUSES) {
+                return response to podRedirectHeaders
+            }
+        }
+
+        throw WolinException("Exceeded maximum redirect hops ($MAX_SAFE_REDIRECTS) while reading $initialUri")
+    }
+
     private fun sendLdpRequest(
         method: String,
         url: String,
@@ -288,11 +344,11 @@ class WolinClient @JvmOverloads constructor(
         expectedStatuses: IntRange,
     ): PodResource {
         val uri = HeaderUtils.validateHttpUri(url)
-        val response = sendRawWithAuthRetry(method, uri, headers, body)
+        val response = sendRawWithAuthRetry(method, uri, headers, body, includeAuth = true)
         if (response.statusCode() !in expectedStatuses) {
             throw toHttpException(url, response)
         }
-        return toPodResource(url, response)
+        return toPodResource(url, response, null)
     }
 
     private fun sendRawWithAuthRetry(
@@ -300,21 +356,29 @@ class WolinClient @JvmOverloads constructor(
         uri: URI,
         headers: Map<String, String>,
         body: ByteArray?,
+        includeAuth: Boolean,
     ): HttpResponse<ByteArray> {
-        val initialNonce = cachedDpopNonce.get()
-        val firstResponse = executeOnce(method, uri, headers, body, initialNonce)
+        val origin = originKey(uri)
+        val initialNonce = dpopNonces[origin]
+        val firstResponse = executeOnce(method, uri, headers, body, initialNonce, includeAuth)
         val serverNonce = HeaderUtils.firstHeader(firstResponse.headers().map(), "dpop-nonce")
         if (!serverNonce.isNullOrBlank()) {
-            cachedDpopNonce.set(serverNonce)
+            dpopNonces[origin] = serverNonce
         }
 
         // RFC 9449 §8: retry once with fresh DPoP proof when server issues a new DPoP-Nonce on 401/400
-        if (accessToken != null &&
+        if (includeAuth &&
+            accessToken != null &&
             (firstResponse.statusCode() == 401 || firstResponse.statusCode() == 400) &&
             !serverNonce.isNullOrBlank() &&
             serverNonce != initialNonce
         ) {
-            return executeOnce(method, uri, headers, body, serverNonce)
+            val retryResponse = executeOnce(method, uri, headers, body, serverNonce, includeAuth = true)
+            val nextNonce = HeaderUtils.firstHeader(retryResponse.headers().map(), "dpop-nonce")
+            if (!nextNonce.isNullOrBlank()) {
+                dpopNonces[origin] = nextNonce
+            }
+            return retryResponse
         }
         return firstResponse
     }
@@ -325,6 +389,7 @@ class WolinClient @JvmOverloads constructor(
         headers: Map<String, String>,
         body: ByteArray?,
         dpopNonce: String?,
+        includeAuth: Boolean,
     ): HttpResponse<ByteArray> {
         val reqBuilder = HttpRequest.newBuilder(uri)
             .timeout(requestTimeout)
@@ -334,7 +399,7 @@ class WolinClient @JvmOverloads constructor(
             reqBuilder.header(name, value)
         }
 
-        if (accessToken != null) {
+        if (includeAuth && accessToken != null) {
             val proof = dpopSigner.signProof(
                 htm = method,
                 htu = uri.toString(),
@@ -362,15 +427,37 @@ class WolinClient @JvmOverloads constructor(
         }
     }
 
-    private fun toPodResource(requestUrl: String, response: HttpResponse<ByteArray>): PodResource {
-        val headerMap = response.headers().map()
+    private fun toPodResource(
+        requestUrl: String,
+        response: HttpResponse<ByteArray>,
+        fallbackHeaders: Map<String, List<String>>?,
+    ): PodResource {
+        val responseHeaders = response.headers().map()
+        val mergedHeaders = if (fallbackHeaders != null) {
+            val combined = LinkedHashMap<String, List<String>>(responseHeaders)
+            for (fallbackKey in listOf("link", "wac-allow", "etag")) {
+                if (HeaderUtils.firstHeader(combined, fallbackKey) == null) {
+                    val fallbackValues = HeaderUtils.allHeaders(fallbackHeaders, fallbackKey)
+                    if (fallbackValues.isNotEmpty()) {
+                        combined[fallbackKey] = fallbackValues
+                    }
+                }
+            }
+            combined
+        } else {
+            responseHeaders
+        }
+
+        val etag = HeaderUtils.firstHeader(responseHeaders, "etag")
+            ?: fallbackHeaders?.let { HeaderUtils.firstHeader(it, "etag") }
+
         return PodResource(
             url = requestUrl,
             body = response.body() ?: ByteArray(0),
-            contentType = HeaderUtils.firstHeader(headerMap, "content-type"),
-            etag = HeaderUtils.firstHeader(headerMap, "etag"),
+            contentType = HeaderUtils.firstHeader(responseHeaders, "content-type"),
+            etag = etag,
             statusCode = response.statusCode(),
-            headers = headerMap,
+            headers = mergedHeaders,
         )
     }
 
@@ -382,6 +469,25 @@ class WolinClient @JvmOverloads constructor(
             responseBody = bodyText,
             headers = response.headers().map(),
         )
+    }
+
+    private fun resolveRedirectUri(baseUri: URI, location: String): URI {
+        val resolved = try {
+            baseUri.resolve(location.trim())
+        } catch (e: Exception) {
+            throw WolinException("Malformed redirect Location '$location': ${e.message}", e)
+        }
+        return HeaderUtils.validateHttpUri(resolved.toString())
+    }
+
+    private fun originKey(uri: URI): String {
+        val scheme = uri.scheme.lowercase()
+        val host = uri.host.lowercase()
+        val port = uri.port
+        val isDefaultPort = port == -1 ||
+            (scheme == "http" && port == 80) ||
+            (scheme == "https" && port == 443)
+        return if (isDefaultPort) "$scheme://$host" else "$scheme://$host:$port"
     }
 
     private fun ensureTrailingSlash(url: String): String =
@@ -431,20 +537,95 @@ class WolinClient @JvmOverloads constructor(
     }
 
     companion object {
+        /** Official Wolin Solid-OIDC Provider & Passport production endpoint. */
+        const val DEFAULT_AUTH_URL = "https://auth.wolin.id"
+
+        /** Official Wolin Sovereign Solid Pod Engine production endpoint. */
+        const val DEFAULT_POD_URL = "https://pod.wolin.id"
+
+        const val MIN_POD_ID_LEN = 3
+        const val MAX_POD_ID_LEN = 32
+
         const val TURTLE_CONTENT_TYPE = "text/turtle"
         const val DEFAULT_ACCEPT = "text/turtle, application/ld+json;q=0.9, */*;q=0.8"
         const val PROFILE_ACCEPT = "text/turtle, application/n-triples;q=0.9, text/n3;q=0.8"
         const val DEFAULT_USER_AGENT = "wolin-sdk-kotlin/0.1.0 (+https://wolin.id)"
 
+        private const val MAX_SAFE_REDIRECTS = 5
+        private val REDIRECT_STATUSES: Set<Int> = setOf(301, 302, 303, 307, 308)
         private val DEFAULT_REQUEST_TIMEOUT: Duration = Duration.ofSeconds(30)
         private val SUCCESS_STATUSES: IntRange = 200..299
+
+        /** Canonical reserved system/infrastructure handles blocked by Wolin Cloud & Engine. */
+        @JvmField
+        val RESERVED_POD_IDS: Set<String> = setOf(
+            "abuse", "admin", "administrator", "ads", "api", "app", "apps", "assets",
+            "auth", "authorize", "autoconfig", "autodiscover", "backup", "beta", "billing", "blog",
+            "calendar", "cdn", "chat", "cloud", "consent", "console", "contact", "control",
+            "corp", "dashboard", "data", "dev", "dns", "doc", "docs", "download",
+            "downloads", "edge", "email", "engine", "enterprise", "entropy", "events", "files",
+            "forum", "ftp", "gateway", "git", "graphql", "health", "healthz", "help",
+            "home", "host", "hostmaster", "id", "idp", "images", "imap", "img",
+            "inbox", "info", "internal", "jwks", "legal", "local", "localhost", "login",
+            "logout", "logs", "mail", "mailer", "manage", "mcp", "media", "metrics",
+            "mta-sts", "mx", "net", "news", "no-reply", "noreply", "notify", "ns",
+            "ns1", "ns2", "ns3", "ns4", "oauth", "official", "oidc", "ops",
+            "org", "origin", "passport", "pay", "payment", "payments", "pod", "pods",
+            "pop", "pop3", "portal", "postmaster", "press", "pricing", "private", "prod",
+            "production", "profile", "proxy", "pub", "public", "register", "registry", "relay",
+            "root", "rpc", "rss", "sandbox", "search", "secure", "security", "server",
+            "service", "services", "session", "settings", "sftp", "signin", "signout", "signup",
+            "smtp", "solid", "sparql", "ssh", "sso", "stage", "staging", "static",
+            "stats", "status", "storage", "store", "support", "sync", "sys", "system",
+            "team", "telemetry", "terms", "test", "testing", "token", "trust", "updates",
+            "upload", "uploads", "userinfo", "vault", "verify", "vpn", "wac", "web",
+            "webhook", "webhooks", "webid", "webmail", "webmaster", "well-known", "wolin", "ws",
+            "wss", "www",
+        )
+
+        /**
+         * Validates a Wolin `pod_id` handle (`3..32` chars, lowercase ASCII `[a-z0-9-]`,
+         * starts and ends with `[a-z0-9]`, no consecutive `'--'`, and not reserved).
+         *
+         * @throws WolinException if [podId] violates any constraint.
+         */
+        @JvmStatic
+        fun validatePodId(podId: String): String {
+            if (podId.length < MIN_POD_ID_LEN || podId.length > MAX_POD_ID_LEN) {
+                throw WolinException("pod_id must be between $MIN_POD_ID_LEN and $MAX_POD_ID_LEN lowercase characters")
+            }
+            if (podId.startsWith('-') || podId.endsWith('-') ||
+                !podId.all { (it in 'a'..'z') || (it in '0'..'9') || it == '-' }
+            ) {
+                throw WolinException("pod_id must contain only lowercase ASCII [a-z0-9-] and start and end with [a-z0-9]")
+            }
+            if (podId.contains("--")) {
+                throw WolinException("pod_id must not contain consecutive hyphens ('--')")
+            }
+            if (podId in RESERVED_POD_IDS) {
+                throw WolinException("pod_id '$podId' is reserved for system infrastructure")
+            }
+            return podId
+        }
+
+        /**
+         * Returns `true` if [podId] satisfies Wolin `pod_id` format and reservation rules.
+         */
+        @JvmStatic
+        fun isValidPodId(podId: String): Boolean =
+            try {
+                validatePodId(podId)
+                true
+            } catch (_: WolinException) {
+                false
+            }
 
         @JvmStatic
         fun builder(): Builder = Builder()
 
         /**
          * Creates a hardened default [HttpClient] with `Redirect.NEVER` so DPoP `Authorization`
-         * and `DPoP` headers are never forwarded across origins or mismatched `htu` targets.
+         * and `DPoP` headers are never auto-forwarded across origins or mismatched `htu` targets.
          */
         @JvmStatic
         fun defaultHttpClient(connectTimeout: Duration = Duration.ofSeconds(15)): HttpClient =
